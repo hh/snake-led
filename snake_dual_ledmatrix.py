@@ -33,6 +33,7 @@ CMD_DRAW_BUFFER = 0x08
 BOARD_WIDTH = 18
 BOARD_HEIGHT = 34
 MODULE_COLS = 9
+MAX_SNAKE_LENGTH = 16  # Snakes cap at 16 pixels; extra length becomes extra lives
 
 SNAKE_BRIGHTNESS_LOW = 0x20  # faint but visible brightness for second player
 SNAKE_BRIGHTNESS_HIGH = 0xFF
@@ -117,6 +118,7 @@ class SnakeState:
     score: int = 0
     brightness: int = SNAKE_BRIGHTNESS_HIGH
     active: bool = True  # False when player is removed from game
+    lives: int = 0  # Extra lives earned from growing past max length
 
     @property
     def head(self) -> Tuple[int, int]:
@@ -273,6 +275,35 @@ def spawn_food(occupied: Sequence[Tuple[int, int]]) -> Food:
     return Food(pos[0], pos[1])
 
 
+def respawn_snake(snake: SnakeState, player_idx: int) -> None:
+    """Respawn a snake at its starting position with initial length."""
+    mid_y = BOARD_HEIGHT // 2
+    row_gap = max(2, BOARD_HEIGHT // 6)
+
+    if player_idx == 0:
+        # Player 1
+        player_row = max(1, mid_y - row_gap)
+        head = (BOARD_WIDTH // 3, player_row)
+        direction = (1, 0)
+    else:
+        # Player 2
+        player_row = min(BOARD_HEIGHT - 2, mid_y + row_gap)
+        head = (BOARD_WIDTH - 3, player_row)
+        direction = (-1, 0)
+
+    # Build initial segments (length 3)
+    segments: List[Tuple[int, int]] = []
+    for i in range(3):
+        offset = 3 - i - 1
+        x = (head[0] - direction[0] * offset) % BOARD_WIDTH
+        y = (head[1] - direction[1] * offset) % BOARD_HEIGHT
+        segments.append((x, y))
+
+    snake.segments = segments
+    snake.direction = direction
+    snake.pending_growth = 0
+
+
 def ensure_food_supply(snakes: Sequence[SnakeState], foods: List[Food]) -> None:
     occupied = {pos for snake in snakes for pos in snake.segments}
     # Include all positions from all food items (including multi-pixel powerups)
@@ -300,26 +331,64 @@ def advance_snakes(snakes: List[SnakeState], foods: List[Food]) -> Tuple[bool, s
         new_heads.append(new_head)
         active_indices.append(idx)
 
+    # Track which snakes crashed and were respawned (don't advance them this frame)
+    respawned_indices = set()
+
     # Check for head-on collision between active snakes
     if len(set(new_heads)) < len(new_heads):
-        return True, "Head-on collision!"
+        # Head-on collision - both snakes involved
+        for i, (idx, snake) in enumerate(active_snakes):
+            if snake.lives > 0:
+                snake.lives -= 1
+                # Respawn at starting position with initial length
+                respawn_snake(snake, idx)
+                respawned_indices.add(idx)
+            else:
+                return True, "Head-on collision!"
+        # If all snakes had lives, continue playing
+        if all(snake.lives >= 0 for _, snake in active_snakes):
+            ensure_food_supply(snakes, foods)
+            return False, ""
 
     # Check for self-collision and collisions with other active snakes
     for i, (idx, snake) in enumerate(active_snakes):
-        new_head = new_heads[i]
-        if new_head in snake.segments:
-            return True, f"{snake.name} ran into itself!"
-        other_segments = {
-            pos
-            for other_idx, other in active_snakes
-            if other_idx != idx
-            for pos in other.segments
-        }
-        if new_head in other_segments:
-            return True, f"{snake.name} crashed into another snake!"
+        if idx in respawned_indices:
+            continue  # Already respawned this snake
 
-    # Advance all active snakes
+        new_head = new_heads[i]
+        crashed = False
+        crash_reason = ""
+
+        if new_head in snake.segments:
+            crashed = True
+            crash_reason = f"{snake.name} ran into itself!"
+        else:
+            other_segments = {
+                pos
+                for other_idx, other in active_snakes
+                if other_idx != idx
+                for pos in other.segments
+            }
+            if new_head in other_segments:
+                crashed = True
+                crash_reason = f"{snake.name} crashed into another snake!"
+
+        if crashed:
+            if snake.lives > 0:
+                # Use an extra life and respawn
+                snake.lives -= 1
+                respawn_snake(snake, idx)
+                respawned_indices.add(idx)
+                # Continue to next snake
+            else:
+                # No lives left, game over
+                return True, crash_reason
+
+    # Advance all active snakes that didn't crash
     for i, (idx, snake) in enumerate(active_snakes):
+        if idx in respawned_indices:
+            continue  # Don't advance respawned snakes this frame
+
         new_head = new_heads[i]
         snake.segments.append(new_head)
         # Check if snake head hits any position of any food item
@@ -335,10 +404,27 @@ def advance_snakes(snakes: List[SnakeState], foods: List[Food]) -> Tuple[bool, s
             else:
                 snake.pending_growth += eaten.value
                 snake.score += eaten.value
+
+        # Handle growth with max length cap and extra lives
         if snake.pending_growth > 0:
             snake.pending_growth -= 1
         else:
             snake.segments.pop(0)
+
+        # Cap snake length at MAX_SNAKE_LENGTH and convert overflow to lives
+        # Virtual length = actual length + pending growth
+        virtual_length = len(snake.segments) + snake.pending_growth
+        if virtual_length > MAX_SNAKE_LENGTH:
+            # Calculate how many complete sets of 16 we have beyond the first 16
+            extra_lives = virtual_length // MAX_SNAKE_LENGTH - 1
+            if extra_lives > snake.lives:
+                snake.lives = extra_lives
+
+            # Cap displayed length at MAX_SNAKE_LENGTH
+            if len(snake.segments) > MAX_SNAKE_LENGTH:
+                overflow = len(snake.segments) - MAX_SNAKE_LENGTH
+                # Remove tail segments to cap at max length
+                snake.segments = snake.segments[overflow:]
 
     ensure_food_supply(snakes, foods)
     return False, ""
@@ -477,12 +563,14 @@ def game_loop(stdscr: "curses._CursesWindow", left: Module, right: Module, tick:
         stdscr.addstr(0, 0, "Snake on dual Framework LED Matrices")
 
         # Player 1 status
-        p1_status = f"P1 (arrows) Score: {snakes[0].score}  Length: {len(snakes[0].segments)}"
+        p1_lives = f" Lives: {snakes[0].lives}" if snakes[0].lives > 0 else ""
+        p1_status = f"P1 (arrows) Score: {snakes[0].score}  Length: {len(snakes[0].segments)}{p1_lives}"
         stdscr.addstr(1, 0, p1_status)
 
         # Player 2 status - show if active or removed
         if snakes[1].active:
-            p2_status = f"P2 (. up, e down, o left, u right) Score: {snakes[1].score}  Length: {len(snakes[1].segments)}"
+            p2_lives = f" Lives: {snakes[1].lives}" if snakes[1].lives > 0 else ""
+            p2_status = f"P2 (. up, e down, o left, u right) Score: {snakes[1].score}  Length: {len(snakes[1].segments)}{p2_lives}"
         else:
             p2_status = "P2 [REMOVED - press any P2 key to rejoin]"
         stdscr.addstr(2, 0, p2_status)
@@ -495,7 +583,7 @@ def game_loop(stdscr: "curses._CursesWindow", left: Module, right: Module, tick:
         stdscr.addstr(
             4,
             0,
-            "Bonus dots blink. 2x2 powerups double your snake!",
+            "Max length: 16. Extra growth = extra lives! 2x2 powerups double length.",
         )
         if crashed:
             stdscr.addstr(5, 0, f"{reason} Press any key to restart.")
