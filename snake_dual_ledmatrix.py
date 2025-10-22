@@ -116,6 +116,7 @@ class SnakeState:
     pending_growth: int = 0
     score: int = 0
     brightness: int = SNAKE_BRIGHTNESS_HIGH
+    active: bool = True  # False when player is removed from game
 
     @property
     def head(self) -> Tuple[int, int]:
@@ -131,6 +132,8 @@ def render_board(
     right = [[0x00 for _ in range(BOARD_HEIGHT)] for _ in range(MODULE_COLS)]
 
     for snake in snakes:
+        if not snake.active:
+            continue
         for x, y in snake.segments:
             cols = left if x < MODULE_COLS else right
             idx = x if x < MODULE_COLS else x - MODULE_COLS
@@ -282,34 +285,45 @@ def ensure_food_supply(snakes: Sequence[SnakeState], foods: List[Food]) -> None:
 
 
 def advance_snakes(snakes: List[SnakeState], foods: List[Food]) -> Tuple[bool, str]:
+    # Only process active snakes
+    active_snakes = [(idx, snake) for idx, snake in enumerate(snakes) if snake.active]
+
+    if not active_snakes:
+        return False, ""
+
     new_heads: List[Tuple[int, int]] = []
-    for snake in snakes:
+    active_indices: List[int] = []
+    for idx, snake in active_snakes:
         head_x, head_y = snake.head
         new_head = ((head_x + snake.direction[0]) % BOARD_WIDTH,
                     (head_y + snake.direction[1]) % BOARD_HEIGHT)
         new_heads.append(new_head)
+        active_indices.append(idx)
 
+    # Check for head-on collision between active snakes
     if len(set(new_heads)) < len(new_heads):
         return True, "Head-on collision!"
 
-    for idx, snake in enumerate(snakes):
-        new_head = new_heads[idx]
+    # Check for self-collision and collisions with other active snakes
+    for i, (idx, snake) in enumerate(active_snakes):
+        new_head = new_heads[i]
         if new_head in snake.segments:
             return True, f"{snake.name} ran into itself!"
         other_segments = {
             pos
-            for other_idx, other in enumerate(snakes)
+            for other_idx, other in active_snakes
             if other_idx != idx
             for pos in other.segments
         }
         if new_head in other_segments:
             return True, f"{snake.name} crashed into another snake!"
 
-    for idx, snake in enumerate(snakes):
-        new_head = new_heads[idx]
+    # Advance all active snakes
+    for i, (idx, snake) in enumerate(active_snakes):
+        new_head = new_heads[i]
         snake.segments.append(new_head)
         # Check if snake head hits any position of any food item
-        eaten_idx = next((i for i, food in enumerate(foods) if new_head in food.positions), None)
+        eaten_idx = next((j for j, food in enumerate(foods) if new_head in food.positions), None)
         if eaten_idx is not None:
             eaten = foods.pop(eaten_idx)
             if eaten.is_powerup:
@@ -364,6 +378,9 @@ def game_loop(stdscr: "curses._CursesWindow", left: Module, right: Module, tick:
     ensure_food_supply(snakes, foods)
     last_tick = time.monotonic()
 
+    # Track up arrow presses for single-player toggle
+    up_press_times: List[float] = []
+
     player_controls = [
         {
             curses.KEY_UP: (0, -1),
@@ -388,15 +405,62 @@ def game_loop(stdscr: "curses._CursesWindow", left: Module, right: Module, tick:
             return
         target.direction = new_dir
 
+    def rejoin_player(player_idx: int) -> None:
+        """Rejoin an inactive player at their opponent's length."""
+        if snakes[player_idx].active:
+            return
+        # Find an active opponent
+        opponent_idx = 1 - player_idx
+        if not snakes[opponent_idx].active:
+            return
+        opponent_length = len(snakes[opponent_idx].segments)
+        # Recreate player at original position with opponent's length
+        if player_idx == 0:
+            head = (BOARD_WIDTH // 3, max(1, BOARD_HEIGHT // 2 - max(2, BOARD_HEIGHT // 6)))
+            direction = (1, 0)
+        else:
+            head = (BOARD_WIDTH - 3, min(BOARD_HEIGHT - 2, BOARD_HEIGHT // 2 + max(2, BOARD_HEIGHT // 6)))
+            direction = (-1, 0)
+        # Build segments
+        segments: List[Tuple[int, int]] = []
+        for i in range(opponent_length):
+            offset = opponent_length - i - 1
+            x = (head[0] - direction[0] * offset) % BOARD_WIDTH
+            y = (head[1] - direction[1] * offset) % BOARD_HEIGHT
+            segments.append((x, y))
+        snakes[player_idx].segments = segments
+        snakes[player_idx].direction = direction
+        snakes[player_idx].active = True
+        snakes[player_idx].pending_growth = 0
+
     while True:
         key = stdscr.getch()
         if key in (ord("q"), ord("Q")):
             break
         if key != -1:
-            if key in player_controls[0]:
+            # Check if P1 pressed up arrow
+            if key == curses.KEY_UP:
+                now = time.monotonic()
+                up_press_times.append(now)
+                # Remove presses older than 1 second
+                up_press_times = [t for t in up_press_times if now - t <= 1.0]
+                # If 5 presses in 1 second, toggle P2
+                if len(up_press_times) >= 5:
+                    snakes[1].active = not snakes[1].active
+                    up_press_times.clear()
+                    if not snakes[1].active:
+                        # Clear P2's segments so they don't block the board
+                        snakes[1].segments = []
+
+            # Handle player controls
+            if key in player_controls[0] and snakes[0].active:
                 set_direction(snakes[0], player_controls[0][key])
             elif key in player_controls[1]:
-                set_direction(snakes[1], player_controls[1][key])
+                # If P2 is inactive, rejoin them
+                if not snakes[1].active:
+                    rejoin_player(1)
+                else:
+                    set_direction(snakes[1], player_controls[1][key])
 
         now = time.monotonic()
         if now - last_tick < tick:
@@ -411,20 +475,22 @@ def game_loop(stdscr: "curses._CursesWindow", left: Module, right: Module, tick:
 
         stdscr.erase()
         stdscr.addstr(0, 0, "Snake on dual Framework LED Matrices")
-        stdscr.addstr(
-            1,
-            0,
-            f"P1 (arrows) Score: {snakes[0].score}  Length: {len(snakes[0].segments)}",
-        )
-        stdscr.addstr(
-            2,
-            0,
-            f"P2 (. up, e down, o left, u right) Score: {snakes[1].score}  Length: {len(snakes[1].segments)}",
-        )
+
+        # Player 1 status
+        p1_status = f"P1 (arrows) Score: {snakes[0].score}  Length: {len(snakes[0].segments)}"
+        stdscr.addstr(1, 0, p1_status)
+
+        # Player 2 status - show if active or removed
+        if snakes[1].active:
+            p2_status = f"P2 (. up, e down, o left, u right) Score: {snakes[1].score}  Length: {len(snakes[1].segments)}"
+        else:
+            p2_status = "P2 [REMOVED - press any P2 key to rejoin]"
+        stdscr.addstr(2, 0, p2_status)
+
         stdscr.addstr(
             3,
             0,
-            f"Food items: {len(foods)}  Quit: q",
+            f"Food items: {len(foods)}  Quit: q  Single-player: UP x5 in 1s",
         )
         stdscr.addstr(
             4,
@@ -442,6 +508,7 @@ def game_loop(stdscr: "curses._CursesWindow", left: Module, right: Module, tick:
             snakes = create_initial_snakes()
             foods.clear()
             ensure_food_supply(snakes, foods)
+            up_press_times.clear()
             clear_module(left)
             clear_module(right)
             last_tick = time.monotonic()
