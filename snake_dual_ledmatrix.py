@@ -6,7 +6,8 @@ Use arrow keys to steer (q to quit).  By default the left matrix is /dev/ttyACM0
 and the right is /dev/ttyACM1; override with --left/--right.
 
 Multiple food dots spawn at once; blinking dots are bonus snacks worth extra
-points and additional body segments.
+points and additional body segments. Watch for 2x2 powerups that double your
+snake's length!
 
 For quick sanity checks without a terminal, pass --demo N to run N automated
 frames without the curses UI.
@@ -37,12 +38,14 @@ SNAKE_BRIGHTNESS_LOW = 0x20  # faint but visible brightness for second player
 SNAKE_BRIGHTNESS_HIGH = 0xFF
 FOOD_BRIGHTNESS = 0x80
 BONUS_BRIGHTNESS = 0xFF
+POWERUP_BRIGHTNESS = 0xC0
 
 DEFAULT_TICK = 0.18
 TARGET_FOOD_COUNT = 3
 BONUS_CHANCE = 0.25
 BONUS_VALUE = 3
 BONUS_BLINK_PERIOD = 0.25
+POWERUP_CHANCE = 0.15  # Chance to spawn a 2x2 powerup
 
 
 @dataclass
@@ -84,10 +87,25 @@ class Food:
     brightness: int = FOOD_BRIGHTNESS
     blink_period: float = 0.0
     created_at: float = field(default_factory=time.monotonic)
+    is_powerup: bool = False  # True for 2x2 powerup that doubles snake length
 
     @property
     def pos(self) -> Tuple[int, int]:
         return (self.x, self.y)
+
+    @property
+    def positions(self) -> List[Tuple[int, int]]:
+        """Returns all positions occupied by this food item."""
+        if self.is_powerup:
+            # 2x2 powerup
+            return [
+                (self.x, self.y),
+                ((self.x + 1) % BOARD_WIDTH, self.y),
+                (self.x, (self.y + 1) % BOARD_HEIGHT),
+                ((self.x + 1) % BOARD_WIDTH, (self.y + 1) % BOARD_HEIGHT),
+            ]
+        else:
+            return [(self.x, self.y)]
 
 
 @dataclass
@@ -119,13 +137,15 @@ def render_board(
             cols[idx][y] = max(cols[idx][y], snake.brightness)
 
     for food in foods:
-        cols = left if food.x < MODULE_COLS else right
-        idx = food.x if food.x < MODULE_COLS else food.x - MODULE_COLS
         brightness = food.brightness
         if food.blink_period > 0:
             phase = int(((now - food.created_at) / food.blink_period)) % 2
             brightness = brightness if phase == 0 else 0
-        cols[idx][food.y] = max(brightness, cols[idx][food.y])
+        # Render all positions occupied by this food item
+        for fx, fy in food.positions:
+            cols = left if fx < MODULE_COLS else right
+            idx = fx if fx < MODULE_COLS else fx - MODULE_COLS
+            cols[idx][fy] = max(brightness, cols[idx][fy])
 
     return left, right
 
@@ -210,6 +230,34 @@ def create_initial_snakes() -> List[SnakeState]:
 
 
 def spawn_food(occupied: Sequence[Tuple[int, int]]) -> Food:
+    occupied_set = set(occupied)
+
+    # Determine food type
+    roll = random.random()
+    if roll < POWERUP_CHANCE:
+        # Spawn 2x2 powerup - need to find a position where all 4 pixels are free
+        max_attempts = 100
+        for _ in range(max_attempts):
+            x = random.randrange(BOARD_WIDTH)
+            y = random.randrange(BOARD_HEIGHT)
+            powerup_positions = [
+                (x, y),
+                ((x + 1) % BOARD_WIDTH, y),
+                (x, (y + 1) % BOARD_HEIGHT),
+                ((x + 1) % BOARD_WIDTH, (y + 1) % BOARD_HEIGHT),
+            ]
+            if all(p not in occupied_set for p in powerup_positions):
+                return Food(
+                    x,
+                    y,
+                    value=0,  # Value will be calculated when eaten
+                    brightness=POWERUP_BRIGHTNESS,
+                    blink_period=0.0,
+                    is_powerup=True,
+                )
+        # If we can't place a 2x2 powerup, fall through to regular food
+
+    # Regular or bonus food
     pos = random_free_cell(occupied)
     if random.random() < BONUS_CHANCE:
         return Food(
@@ -224,11 +272,13 @@ def spawn_food(occupied: Sequence[Tuple[int, int]]) -> Food:
 
 def ensure_food_supply(snakes: Sequence[SnakeState], foods: List[Food]) -> None:
     occupied = {pos for snake in snakes for pos in snake.segments}
-    occupied.update(food.pos for food in foods)
+    # Include all positions from all food items (including multi-pixel powerups)
+    for food in foods:
+        occupied.update(food.positions)
     while len(foods) < TARGET_FOOD_COUNT:
         new_food = spawn_food(list(occupied))
         foods.append(new_food)
-        occupied.add(new_food.pos)
+        occupied.update(new_food.positions)
 
 
 def advance_snakes(snakes: List[SnakeState], foods: List[Food]) -> Tuple[bool, str]:
@@ -258,11 +308,19 @@ def advance_snakes(snakes: List[SnakeState], foods: List[Food]) -> Tuple[bool, s
     for idx, snake in enumerate(snakes):
         new_head = new_heads[idx]
         snake.segments.append(new_head)
-        eaten_idx = next((i for i, food in enumerate(foods) if food.pos == new_head), None)
+        # Check if snake head hits any position of any food item
+        eaten_idx = next((i for i, food in enumerate(foods) if new_head in food.positions), None)
         if eaten_idx is not None:
             eaten = foods.pop(eaten_idx)
-            snake.pending_growth += eaten.value
-            snake.score += eaten.value
+            if eaten.is_powerup:
+                # Powerup doubles the snake's current length
+                current_length = len(snake.segments)
+                growth_amount = current_length
+                snake.pending_growth += growth_amount
+                snake.score += 10  # Powerup gives 10 points
+            else:
+                snake.pending_growth += eaten.value
+                snake.score += eaten.value
         if snake.pending_growth > 0:
             snake.pending_growth -= 1
         else:
@@ -371,7 +429,7 @@ def game_loop(stdscr: "curses._CursesWindow", left: Module, right: Module, tick:
         stdscr.addstr(
             4,
             0,
-            "Bonus dots blink and add extra length.",
+            "Bonus dots blink. 2x2 powerups double your snake!",
         )
         if crashed:
             stdscr.addstr(5, 0, f"{reason} Press any key to restart.")
