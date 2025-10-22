@@ -45,7 +45,7 @@ TARGET_FOOD_COUNT = 3
 BONUS_CHANCE = 0.25
 BONUS_VALUE = 3
 BONUS_BLINK_PERIOD = 0.25
-POWERUP_CHANCE = 0.15  # Chance to spawn a 2x2 powerup
+POWERUP_CHANCE = 0.10  # Chance to spawn a 2x2 powerup
 
 
 @dataclass
